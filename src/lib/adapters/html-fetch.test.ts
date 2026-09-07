@@ -329,3 +329,45 @@ describe("fetchTrackerHtml - through a proxy", () => {
     await expect(fetchThroughProxy(PROXY)).rejects.toThrow("ExampleTracker page fetch failed: 500")
   })
 })
+
+// Sec-Fetch-Site is a claim about where the request came from, and it changes
+// after the first hop. Sending `same-origin` on the opening navigation says a
+// page on the site linked here, with no Referer to back it up — a combination no
+// browser emits, and one a tracker that fingerprints sessions can refuse.
+describe("fetchTrackerHtml - Sec-Fetch-Site coherence", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it("opens with Sec-Fetch-Site: none and switches to same-origin on a followed hop", async () => {
+    const sites: (string | undefined)[] = []
+    vi.spyOn(global, "fetch").mockImplementation((_url, init) => {
+      const headers = init?.headers as Record<string, string>
+      sites.push(headers["Sec-Fetch-Site"])
+      return Promise.resolve(
+        sites.length === 1 ? redirectResponse("/t") : htmlResponse("<html>stats</html>")
+      )
+    })
+
+    await fetchTrackerHtml({
+      ...BASE,
+      userAgent: "Mozilla/5.0 (Test)",
+      followRedirects: { loginPattern: /\/login/i },
+    })
+
+    expect(sites).toEqual(["none", "same-origin"])
+  })
+
+  it("sends no Sec-Fetch-Site at all without a User-Agent", async () => {
+    let headers: Record<string, string> | undefined
+    vi.spyOn(global, "fetch").mockImplementationOnce((_url, init) => {
+      headers = init?.headers as Record<string, string>
+      return Promise.resolve(htmlResponse("<html></html>"))
+    })
+
+    await fetchTrackerHtml(BASE)
+
+    expect(headers?.["Sec-Fetch-Site"]).toBeUndefined()
+    expect(headers?.["Sec-Fetch-Mode"]).toBeUndefined()
+  })
+})

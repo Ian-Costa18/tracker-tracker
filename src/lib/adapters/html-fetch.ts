@@ -20,14 +20,26 @@ import type { FetchOptions } from "./types"
  * Headers a browser sends on a top-level navigation. Only coherent alongside a
  * real browser User-Agent, so adapters authenticating with cookies copied from
  * DevTools send them while adapters using a server-issued session do not.
+ *
+ * Sec-Fetch-Site is supplied per request rather than fixed here: see FetchSite.
  */
 const NAVIGATION_HEADERS: Record<string, string> = {
   DNT: "1",
   "Sec-Fetch-Dest": "document",
   "Sec-Fetch-Mode": "navigate",
-  "Sec-Fetch-Site": "same-origin",
   Connection: "keep-alive",
 }
+
+/**
+ * Where the request came from, and it is not the same on every hop. A top-level
+ * navigation the user initiated is `none`; only a request issued from a page
+ * already on the site is `same-origin`. These adapters open with a navigation to
+ * a bare URL, so `same-origin` there is a claim no browser makes — it says a
+ * page on the site linked here while sending no Referer to back it up. A tracker
+ * that fingerprints sessions can act on that, and the session it refuses is one
+ * it would otherwise accept.
+ */
+type FetchSite = "none" | "same-origin"
 
 const ACCEPT_HTML = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 
@@ -48,12 +60,18 @@ export interface TrackerHtmlRequest {
   followRedirects?: { loginPattern: RegExp; maxHops?: number }
 }
 
-function buildHtmlHeaders(cookies: string, userAgent?: string): Record<string, string> {
+function buildHtmlHeaders(
+  cookies: string,
+  userAgent: string | undefined,
+  site: FetchSite
+): Record<string, string> {
   return {
     Cookie: cookies,
     Accept: ACCEPT_HTML,
     "Accept-Language": "en-US,en;q=0.9",
-    ...(userAgent ? { "User-Agent": userAgent, ...NAVIGATION_HEADERS } : {}),
+    ...(userAgent
+      ? { "User-Agent": userAgent, ...NAVIGATION_HEADERS, "Sec-Fetch-Site": site }
+      : {}),
   }
 }
 
@@ -89,13 +107,10 @@ interface HtmlResponse {
 }
 
 /** Performs one request and returns its response as-is, following nothing. */
-type HtmlTransport = (url: string) => Promise<HtmlResponse>
+type HtmlTransport = (url: string, headers: Record<string, string>) => Promise<HtmlResponse>
 
-function proxyTransport(
-  headers: Record<string, string>,
-  proxyAgent: NonNullable<FetchOptions["proxyAgent"]>
-): HtmlTransport {
-  return async (url) => {
+function proxyTransport(proxyAgent: NonNullable<FetchOptions["proxyAgent"]>): HtmlTransport {
+  return async (url, headers) => {
     const { proxyFetch } = await import("@/lib/tunnel")
     const result = await proxyFetch(url, proxyAgent, {
       headers,
@@ -116,8 +131,8 @@ function proxyTransport(
   }
 }
 
-function directTransport(headers: Record<string, string>): HtmlTransport {
-  return async (url) => {
+function directTransport(): HtmlTransport {
+  return async (url, headers) => {
     const response = await fetch(url, {
       headers,
       signal: AbortSignal.timeout(ADAPTER_FETCH_TIMEOUT_MS),
@@ -146,7 +161,7 @@ function directTransport(headers: Record<string, string>): HtmlTransport {
 async function followRedirectChain(
   response: HtmlResponse,
   fromUrl: string,
-  fetchOnce: HtmlTransport,
+  fetchOnce: (url: string) => Promise<HtmlResponse>,
   { loginPattern, maxHops = 3 }: NonNullable<TrackerHtmlRequest["followRedirects"]>,
   sessionExpiredMessage: string,
   label: string
@@ -191,19 +206,21 @@ async function followRedirectChain(
 export async function fetchTrackerHtml(request: TrackerHtmlRequest): Promise<string> {
   const { url, cookies, label, sessionExpiredMessage, userAgent, proxyAgent, followRedirects } =
     request
-  const headers = buildHtmlHeaders(cookies, userAgent)
   // Both transports go through the same walk below. Returning the proxied
   // response early instead left followRedirects silently ignored whenever a
   // proxy was configured, which no adapter can detect or work around.
-  const fetchOnce = proxyAgent ? proxyTransport(headers, proxyAgent) : directTransport(headers)
+  const transport = proxyAgent ? proxyTransport(proxyAgent) : directTransport()
+  // The opening request is a navigation; anything the walk follows is issued by
+  // the page it just landed on, which is what makes `same-origin` true there.
+  const hopHeaders = buildHtmlHeaders(cookies, userAgent, "same-origin")
 
-  let response = await fetchOnce(url)
+  let response = await transport(url, buildHtmlHeaders(cookies, userAgent, "none"))
 
   if (followRedirects) {
     response = await followRedirectChain(
       response,
       url,
-      fetchOnce,
+      (hopUrl) => transport(hopUrl, hopHeaders),
       followRedirects,
       sessionExpiredMessage,
       label
