@@ -275,3 +275,29 @@ describe("IptorrentsAdapter - redirect handling", () => {
     expect(callCount).toBe(2)
   })
 })
+
+// Every other fixture here writes the username anchor as a bare
+// `<a class="uname">name</a>`, which is why this went unnoticed: on the live page
+// the anchor is a tTipWrap like the stat items, and carries a tooltip child.
+// The shape below is the live markup, with invented values:
+//   <a href="/u/…" class="tTipWrap uname"><div class="tTip ttop">Profile</div>NAME</a>
+describe("parseIptProfile - username", () => {
+  const withTooltip = (name: string) =>
+    `<div class="stats"><div><div><a href="/u/1234" class="tTipWrap uname"><div class="tTip ttop">Profile</div>${name}</a></div></div>` +
+    `<span class="tTipWrap"><div class="tTip">Uploaded</div>10 GB</span>` +
+    `<span class="tTipWrap"><div class="tTip">Downloaded</div>5 GB</span>` +
+    `<span class="tTipWrap"><div class="tTip">Active Torrents</div>3 1</span>` +
+    `<span class="tTipWrap"><div class="tTip">Bonus Points</div>100</span></div>`
+
+  it("strips the Profile tooltip rather than prefixing it to the name", () => {
+    expect(parseIptProfile(withTooltip("testuser")).username).toBe("testuser")
+  })
+
+  it("keeps a name that itself starts with the tooltip text", () => {
+    expect(parseIptProfile(withTooltip("ProfileHunter")).username).toBe("ProfileHunter")
+  })
+
+  it("still reads an anchor with no tooltip child", () => {
+    expect(parseIptProfile(STATS_HTML).username).toBe("testuser")
+  })
+})

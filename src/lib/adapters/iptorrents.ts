@@ -117,7 +117,13 @@ export function parseIptProfile(html: string): TrackerStats {
     )
   }
 
-  const username = doc.querySelector(".uname")?.textContent?.trim() ?? ""
+  // The username anchor carries a tooltip child: `<a class="tTipWrap uname">
+  // <div class="tTip">Profile</div>NAME</a>`. textContent on the anchor returns
+  // "ProfileNAME", so the tooltip is stripped the same way the stat items are.
+  const unameEl = doc.querySelector(".uname")
+  const username = unameEl
+    ? valueAfterLabel(unameEl, unameEl.querySelector(".tTip")?.textContent?.trim() ?? "")
+    : ""
 
   let uploadedBytes = 0n
   let downloadedBytes = 0n
