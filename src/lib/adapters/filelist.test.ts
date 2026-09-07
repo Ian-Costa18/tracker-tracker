@@ -661,6 +661,7 @@ describe("FilelistAdapter — proxy routing", () => {
       ok: true,
       status: 200,
       statusText: "OK",
+      headers: {},
       buffer: async () => Buffer.from(FULL_PAGE),
     })
     vi.doMock("@/lib/tunnel", () => ({ proxyFetch }))

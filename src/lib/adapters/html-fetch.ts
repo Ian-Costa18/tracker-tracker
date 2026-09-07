@@ -1,7 +1,7 @@
 // src/lib/adapters/html-fetch.ts
 //
-// Functions: buildHtmlHeaders, fetchFailure, fetchViaProxy, getHtml, isRedirect,
-//            followRedirectChain, fetchTrackerHtml
+// Functions: buildHtmlHeaders, fetchFailure, proxyTransport, directTransport,
+//            isRedirect, followRedirectChain, fetchTrackerHtml
 
 import { classifyFetchError, sanitizeNetworkError } from "@/lib/error-utils"
 import { ADAPTER_FETCH_TIMEOUT_MS } from "@/lib/limits"
@@ -63,28 +63,6 @@ function fetchFailure(label: string, status: number, statusText: string): Error 
   )
 }
 
-async function fetchViaProxy(
-  url: string,
-  headers: Record<string, string>,
-  proxyAgent: NonNullable<FetchOptions["proxyAgent"]>,
-  label: string
-): Promise<string> {
-  const { proxyFetch } = await import("@/lib/tunnel")
-  const result = await proxyFetch(url, proxyAgent, { headers })
-  if (!result.ok) throw fetchFailure(label, result.status, result.statusText)
-  return (await result.buffer()).toString("utf8")
-}
-
-function getHtml(url: string, headers: Record<string, string>): Promise<Response> {
-  return fetch(url, {
-    headers,
-    signal: AbortSignal.timeout(ADAPTER_FETCH_TIMEOUT_MS),
-    redirect: "manual",
-  }).catch((err) => {
-    throw classifyFetchError(err, new URL(url).hostname)
-  })
-}
-
 /**
  * Every status that carries a Location, not just the two most common. A status
  * missing from this set is returned to the caller as though it were the final
@@ -98,17 +76,81 @@ function isRedirect(status: number): boolean {
 }
 
 /**
- * Walks a redirect chain by hand (redirect: "manual") so a bounce to the login
- * page can be distinguished from an ordinary relocation such as / -> /t.
+ * The part of a response the redirect walk and the caller need, produced
+ * identically by both transports. Without it the two paths cannot share the
+ * walk below, and only one of them ever gets to follow a redirect.
+ */
+interface HtmlResponse {
+  ok: boolean
+  status: number
+  statusText: string
+  location: string | null
+  text: () => Promise<string>
+}
+
+/** Performs one request and returns its response as-is, following nothing. */
+type HtmlTransport = (url: string) => Promise<HtmlResponse>
+
+function proxyTransport(
+  headers: Record<string, string>,
+  proxyAgent: NonNullable<FetchOptions["proxyAgent"]>
+): HtmlTransport {
+  return async (url) => {
+    const { proxyFetch } = await import("@/lib/tunnel")
+    const result = await proxyFetch(url, proxyAgent, {
+      headers,
+      timeoutMs: ADAPTER_FETCH_TIMEOUT_MS,
+    })
+    // node types a header as string | string[]; Location is single-valued, and a
+    // server sending two is malformed, so the first is the only sane reading.
+    const location = result.headers.location
+    return {
+      ok: result.ok,
+      status: result.status,
+      statusText: result.statusText,
+      location: isRedirect(result.status)
+        ? ((Array.isArray(location) ? location[0] : location) ?? null)
+        : null,
+      text: async () => (await result.buffer()).toString("utf8"),
+    }
+  }
+}
+
+function directTransport(headers: Record<string, string>): HtmlTransport {
+  return async (url) => {
+    const response = await fetch(url, {
+      headers,
+      signal: AbortSignal.timeout(ADAPTER_FETCH_TIMEOUT_MS),
+      redirect: "manual",
+    }).catch((err) => {
+      throw classifyFetchError(err, new URL(url).hostname)
+    })
+
+    return {
+      ok: response.ok,
+      status: response.status,
+      statusText: response.statusText,
+      // Only a redirect's Location means anything here, and reading it is what
+      // requires a headers object at all.
+      location: isRedirect(response.status) ? response.headers.get("location") : null,
+      text: () => response.text(),
+    }
+  }
+}
+
+/**
+ * Walks a redirect chain by hand (nothing else follows one: the direct fetch is
+ * redirect: "manual" and https.request never followed one) so a bounce to the
+ * login page can be distinguished from an ordinary relocation such as / -> /t.
  */
 async function followRedirectChain(
-  response: Response,
+  response: HtmlResponse,
   fromUrl: string,
-  headers: Record<string, string>,
+  fetchOnce: HtmlTransport,
   { loginPattern, maxHops = 3 }: NonNullable<TrackerHtmlRequest["followRedirects"]>,
   sessionExpiredMessage: string,
   label: string
-): Promise<Response> {
+): Promise<HtmlResponse> {
   let current = response
   let currentUrl = fromUrl
   const origin = new URL(fromUrl).origin
@@ -116,13 +158,13 @@ async function followRedirectChain(
   for (let hop = 0; hop <= maxHops; hop++) {
     if (!isRedirect(current.status)) return current
 
-    const location = current.headers.get("location") ?? ""
+    const location = current.location ?? ""
     if (loginPattern.test(location)) throw new Error(sessionExpiredMessage)
     // A redirect with no Location is malformed and cannot be followed.
     if (!location || hop === maxHops) break
 
     const nextUrl = new URL(location, currentUrl)
-    // `headers` carries the user's tracker session cookie. Location is chosen by
+    // The request carries the user's tracker session cookie. Location is chosen by
     // the remote host, so following it blindly would replay that cookie wherever
     // the response points. A hostile or compromised tracker could harvest the
     // session with a single 302. Refuse to leave the origin rather than stripping
@@ -135,7 +177,7 @@ async function followRedirectChain(
     }
 
     currentUrl = nextUrl.href
-    current = await getHtml(currentUrl, headers)
+    current = await fetchOnce(currentUrl)
   }
 
   throw new Error(`Too many redirects from ${label}`)
@@ -150,16 +192,18 @@ export async function fetchTrackerHtml(request: TrackerHtmlRequest): Promise<str
   const { url, cookies, label, sessionExpiredMessage, userAgent, proxyAgent, followRedirects } =
     request
   const headers = buildHtmlHeaders(cookies, userAgent)
+  // Both transports go through the same walk below. Returning the proxied
+  // response early instead left followRedirects silently ignored whenever a
+  // proxy was configured, which no adapter can detect or work around.
+  const fetchOnce = proxyAgent ? proxyTransport(headers, proxyAgent) : directTransport(headers)
 
-  if (proxyAgent) return fetchViaProxy(url, headers, proxyAgent, label)
-
-  let response = await getHtml(url, headers)
+  let response = await fetchOnce(url)
 
   if (followRedirects) {
     response = await followRedirectChain(
       response,
       url,
-      headers,
+      fetchOnce,
       followRedirects,
       sessionExpiredMessage,
       label

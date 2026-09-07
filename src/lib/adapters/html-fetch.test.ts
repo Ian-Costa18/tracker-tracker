@@ -1,5 +1,5 @@
 // src/lib/adapters/html-fetch.test.ts
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { fetchTrackerHtml } from "./html-fetch"
 
 const BASE = {
@@ -236,5 +236,96 @@ describe("fetchTrackerHtml - errors", () => {
     vi.spyOn(global, "fetch").mockRejectedValueOnce(new TypeError("fetch failed", { cause }))
 
     await expect(fetchTrackerHtml(BASE)).rejects.toThrow("tracker.example")
+  })
+})
+
+// The proxied path used to return the first response directly, so a configured
+// proxy silently turned redirect following off: IPTorrents, whose stats page is
+// only reachable through the routine / -> /t bounce, could never be read through
+// a tunnel. These pin the two paths to the same behaviour.
+describe("fetchTrackerHtml - through a proxy", () => {
+  const PROXY = { ...BASE, url: "https://tracker.example/", proxyAgent: {} as never }
+
+  function proxyResponse(status: number, { body = "", location = "" } = {}) {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      statusText: status === 302 ? "Found" : "OK",
+      headers: location ? { location } : {},
+      buffer: () => Promise.resolve(Buffer.from(body, "utf8")),
+    }
+  }
+
+  /** Re-imports the module with @/lib/tunnel mocked, since proxyFetch is imported lazily. */
+  async function loadWithProxyFetch(proxyFetch: unknown) {
+    vi.doMock("@/lib/tunnel", () => ({ proxyFetch }))
+    vi.resetModules()
+    return (await import("./html-fetch")).fetchTrackerHtml
+  }
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  afterEach(() => {
+    vi.doUnmock("@/lib/tunnel")
+    vi.resetModules()
+  })
+
+  it("follows a same-origin redirect instead of failing on the 302", async () => {
+    const proxyFetch = vi
+      .fn()
+      .mockResolvedValueOnce(proxyResponse(302, { location: "/t" }))
+      .mockResolvedValueOnce(proxyResponse(200, { body: "<html>stats</html>" }))
+    const fetchSpy = vi.spyOn(global, "fetch")
+    const fetchThroughProxy = await loadWithProxyFetch(proxyFetch)
+
+    const html = await fetchThroughProxy({
+      ...PROXY,
+      followRedirects: { loginPattern: /\/login/i },
+    })
+
+    expect(html).toBe("<html>stats</html>")
+    expect(proxyFetch.mock.calls[1][0]).toBe("https://tracker.example/t")
+    // A fall-through to fetch() would leave the tunnel and expose the real IP.
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it("reports an expired session when the proxied redirect points at login", async () => {
+    const proxyFetch = vi.fn().mockResolvedValue(proxyResponse(302, { location: "/login" }))
+    const fetchThroughProxy = await loadWithProxyFetch(proxyFetch)
+
+    await expect(
+      fetchThroughProxy({ ...PROXY, followRedirects: { loginPattern: /\/login/i } })
+    ).rejects.toThrow("Session expired")
+    expect(proxyFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it("refuses an off-site redirect, and sends nothing there", async () => {
+    const proxyFetch = vi
+      .fn()
+      .mockResolvedValue(proxyResponse(302, { location: "https://attacker.example/collect" }))
+    const fetchThroughProxy = await loadWithProxyFetch(proxyFetch)
+
+    await expect(
+      fetchThroughProxy({ ...PROXY, followRedirects: { loginPattern: /\/login/i } })
+    ).rejects.toThrow("redirected off-site")
+
+    expect(proxyFetch).toHaveBeenCalledTimes(1)
+    expect(String(proxyFetch.mock.calls[0][0])).not.toContain("attacker.example")
+  })
+
+  it("treats a redirect as an expired session when redirects are not followed", async () => {
+    const proxyFetch = vi.fn().mockResolvedValue(proxyResponse(302, { location: "/login" }))
+    const fetchThroughProxy = await loadWithProxyFetch(proxyFetch)
+
+    await expect(fetchThroughProxy(PROXY)).rejects.toThrow("Session expired")
+  })
+
+  it("still reports a non-redirect failure with the tracker label", async () => {
+    const proxyFetch = vi.fn().mockResolvedValue(proxyResponse(500))
+    const fetchThroughProxy = await loadWithProxyFetch(proxyFetch)
+
+    await expect(fetchThroughProxy(PROXY)).rejects.toThrow("ExampleTracker page fetch failed: 500")
   })
 })

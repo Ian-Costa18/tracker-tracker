@@ -398,6 +398,7 @@ describe("AvistazAdapter.fetchStats — network error classification", () => {
       ok: false,
       status: 302,
       statusText: "Found",
+      headers: new Headers(),
     } as Response)
 
     await expect(adapter.fetchStats("https://avistaz.to", validToken, "")).rejects.toThrow(
