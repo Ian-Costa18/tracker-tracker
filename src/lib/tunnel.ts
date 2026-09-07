@@ -1,10 +1,12 @@
 // src/lib/tunnel.ts
 //
-// Functions: buildProxyUrl, createProxyAgent, proxyFetch, buildProxyAgentFromSettings
+// Functions: buildProxyUrl, createProxyAgent, decodeBody, proxyFetch,
+//            buildProxyAgentFromSettings
 // Exports: VALID_PROXY_TYPES, PROXY_HOST_PATTERN, ProxyType, ProxyConfig, ProxyFetchResult, ProxySettings
 
 import type { Agent as HttpAgent, IncomingHttpHeaders } from "node:http"
 import https from "node:https"
+import zlib from "node:zlib"
 import { HttpsProxyAgent } from "https-proxy-agent"
 import { SocksProxyAgent } from "socks-proxy-agent"
 
@@ -48,6 +50,42 @@ export function createProxyAgent(config: ProxyConfig): HttpAgent {
     return new SocksProxyAgent(url)
   }
   return new HttpsProxyAgent(url)
+}
+
+/**
+ * Decodes a Content-Encoding that node did not.
+ *
+ * `fetch()` negotiates and unwraps compression on its own; https.request does
+ * neither, and it hands the caller the compressed bytes with no error. A server
+ * may compress a response it was never asked to compress — IPTorrents returns
+ * gzip to a request carrying no Accept-Encoding at all — so the proxied path
+ * parsed `1f 8b …` as HTML and reported the page as unrecognizable. Every
+ * failure this produces is a content failure, which is the wrong place to look.
+ */
+export function decodeBody(raw: Buffer, encoding: string | string[] | undefined): Buffer {
+  const header = Array.isArray(encoding) ? encoding[0] : encoding
+  const enc = header?.trim().toLowerCase()
+  if (!enc || enc === "identity") return raw
+
+  try {
+    if (enc === "gzip" || enc === "x-gzip") return zlib.gunzipSync(raw)
+    // A "deflate" body is zlib-wrapped per the RFC and bare in the wild, and
+    // which one arrived is only discoverable by trying.
+    if (enc === "deflate") {
+      try {
+        return zlib.inflateSync(raw)
+      } catch {
+        return zlib.inflateRawSync(raw)
+      }
+    }
+    if (enc === "br") return zlib.brotliDecompressSync(raw)
+  } catch (err) {
+    throw new Error(`Could not decode ${enc} response: ${(err as Error).message}`)
+  }
+
+  // An encoding nothing here understands. Returning the bytes would hand the
+  // caller something that only looks like a parse failure.
+  throw new Error(`Unsupported Content-Encoding: ${enc}`)
 }
 
 export interface ProxyFetchResult {
@@ -121,7 +159,19 @@ export function proxyFetch(
           chunks.push(chunk)
         })
         res.on("end", () => {
-          const raw = Buffer.concat(chunks)
+          let raw: Buffer
+          try {
+            raw = decodeBody(Buffer.concat(chunks), res.headers["content-encoding"])
+          } catch (err) {
+            reject(err)
+            return
+          }
+          // maxBytes above counted bytes off the wire; a compressed body can
+          // expand well past it, so the decoded size is checked too.
+          if (maxBytes > 0 && raw.length > maxBytes) {
+            reject(new Error(`Response exceeded ${maxBytes} byte limit`))
+            return
+          }
           resolve({
             ok: (res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 300,
             status: res.statusCode ?? 0,
