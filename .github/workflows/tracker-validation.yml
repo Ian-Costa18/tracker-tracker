@@ -109,7 +109,7 @@ jobs:
 
             // A pull_request run from a fork gets a read-only GITHUB_TOKEN, so any
             // comment call returns 403. Results go to the job summary instead.
-            const isFork = context.payload.pull_request.head.repo.full_name !== context.payload.repository.full_name;
+            const isFork = context.payload.pull_request.head.repo?.full_name !== context.payload.repository.full_name;
 
             if (nonDraft.length === 0 || (!hasErrors && !hasWarnings)) {
               await core.summary.addRaw('✅ Tracker registry validation passed').write();
