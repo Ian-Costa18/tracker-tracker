@@ -133,10 +133,9 @@ export const AVATAR_FETCH_MAX_BYTES = 5 * 1024 * 1024
 export const QBT_RESPONSE_MAX_BYTES = 64 * 1024 * 1024
 
 /**
- * Ceiling on a decoded proxied response when the caller set no maxBytes. A few
- * kilobytes of gzip can inflate to gigabytes, so zlib is stopped at this size
- * rather than the result measured afterwards. Tracker pages and API responses
- * are kilobytes; this only has to stop a decompression bomb.
+ * Ceiling on a decoded proxied response when the caller set no maxBytes.
+ * Tracker pages and API responses are kilobytes, so this only has to stop a
+ * decompression bomb.
  */
 export const PROXY_DECODED_MAX_BYTES = 16 * 1024 * 1024
 
